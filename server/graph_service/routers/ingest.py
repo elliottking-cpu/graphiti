@@ -1,8 +1,8 @@
 import asyncio
-from contextlib import asynccontextmanager
+import logging
 from functools import partial
 
-from fastapi import APIRouter, FastAPI, status
+from fastapi import APIRouter, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
@@ -16,13 +16,24 @@ class AsyncWorker:
         self.task = None
 
     async def worker(self):
+        # Septics Hub patch: catch ALL exceptions from a job so one failure
+        # cannot kill the worker. Upstream only catches CancelledError, which
+        # means any OpenAI/Neo4j/payload error permanently stops processing
+        # while POST /messages keeps returning 202 (issue #566).
         while True:
             try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
                 job = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+            print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
+            try:
                 await job()
             except asyncio.CancelledError:
                 break
+            except Exception:
+                logging.exception('[graphiti] ingest job failed; worker continues')
+            finally:
+                self.queue.task_done()
 
     async def start(self):
         self.task = asyncio.create_task(self.worker())
@@ -30,7 +41,10 @@ class AsyncWorker:
     async def stop(self):
         if self.task:
             self.task.cancel()
-            await self.task
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
         while not self.queue.empty():
             self.queue.get_nowait()
 
@@ -38,14 +52,10 @@ class AsyncWorker:
 async_worker = AsyncWorker()
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    await async_worker.start()
-    yield
-    await async_worker.stop()
-
-
-router = APIRouter(lifespan=lifespan)
+# Septics Hub patch: worker start/stop is now driven from the app lifespan
+# in main.py. The router no longer carries its own lifespan, which avoids
+# any reliance on FastAPI nested-lifespan merging.
+router = APIRouter()
 
 
 @router.post('/messages', status_code=status.HTTP_202_ACCEPTED)

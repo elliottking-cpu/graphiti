@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from graph_service.config import get_settings
 from graph_service.routers import ingest, retrieve
+from graph_service.routers.ingest import async_worker
 from graph_service.zep_graphiti import initialize_graphiti
 
 
@@ -12,9 +13,13 @@ from graph_service.zep_graphiti import initialize_graphiti
 async def lifespan(_: FastAPI):
     settings = get_settings()
     await initialize_graphiti(settings)
-    yield
-    # Shutdown
-    # No need to close Graphiti here, as it's handled per-request
+    # Septics Hub patch: start the ingest worker explicitly here so we never
+    # depend on FastAPI nested-router-lifespan merging.
+    await async_worker.start()
+    try:
+        yield
+    finally:
+        await async_worker.stop()
 
 
 app = FastAPI(lifespan=lifespan)
