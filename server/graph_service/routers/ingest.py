@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from functools import partial
 
 from fastapi import APIRouter, status
@@ -10,12 +11,34 @@ from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message,
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 
+# Septics Hub patch: run multiple worker coroutines so we can overlap
+# the slow OpenAI extract+embed step (~10 s/episode) across the queue.
+# A single worker caps throughput at ~6 episodes/min; 4 workers raise
+# that ceiling to ~24 episodes/min, which is the difference between a
+# production seed completing in 6 h vs ~45 min. Configurable via env
+# var GRAPHITI_WORKER_CONCURRENCY (defaults to 4) so the deployment
+# can dial it up/down depending on the OpenAI rate-limit budget.
+_DEFAULT_WORKER_CONCURRENCY = 4
+
+
+def _resolve_worker_concurrency() -> int:
+    raw = os.environ.get('GRAPHITI_WORKER_CONCURRENCY')
+    if not raw:
+        return _DEFAULT_WORKER_CONCURRENCY
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_WORKER_CONCURRENCY
+    return max(1, min(n, 16))
+
+
 class AsyncWorker:
     def __init__(self):
         self.queue = asyncio.Queue()
-        self.task = None
+        self.tasks: list[asyncio.Task] = []
+        self.concurrency = _resolve_worker_concurrency()
 
-    async def worker(self):
+    async def worker(self, worker_id: int):
         # Septics Hub patch: catch ALL exceptions from a job so one failure
         # cannot kill the worker. Upstream only catches CancelledError, which
         # means any OpenAI/Neo4j/payload error permanently stops processing
@@ -25,26 +48,32 @@ class AsyncWorker:
                 job = await self.queue.get()
             except asyncio.CancelledError:
                 break
-            print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
+            print(f'Worker {worker_id} got a job: (size of remaining queue: {self.queue.qsize()})')
             try:
                 await job()
             except asyncio.CancelledError:
                 break
             except Exception:
-                logging.exception('[graphiti] ingest job failed; worker continues')
+                logging.exception(f'[graphiti] ingest job failed on worker {worker_id}; worker continues')
             finally:
                 self.queue.task_done()
 
     async def start(self):
-        self.task = asyncio.create_task(self.worker())
+        self.tasks = [
+            asyncio.create_task(self.worker(i + 1))
+            for i in range(self.concurrency)
+        ]
+        print(f'AsyncWorker started with concurrency={self.concurrency}')
 
     async def stop(self):
-        if self.task:
-            self.task.cancel()
+        for task in self.tasks:
+            task.cancel()
+        for task in self.tasks:
             try:
-                await self.task
+                await task
             except asyncio.CancelledError:
                 pass
+        self.tasks = []
         while not self.queue.empty():
             self.queue.get_nowait()
 
