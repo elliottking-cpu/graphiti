@@ -44,12 +44,10 @@ COPY ./server/graph_service ./graph_service
 # Then install graphiti-core from PyPI at the desired version
 # This prevents the stale lockfile from pinning an old graphiti-core version
 ARG INSTALL_FALKORDB=false
-# Septics Hub patch: add `id` to the BuildKit cache mount so Railway's Kaniko
-# builder accepts it. Upstream omits the id, which works on docker buildx and
-# Depot but fails on Railway with "flag '--mount=type=cache,...' is missing an
-# id argument at Line 47".
-RUN --mount=type=cache,id=uv,target=/root/.cache/uv \
-    uv sync --frozen --no-dev && \
+# Septics Hub patch: drop the BuildKit cache mount. Railway's Kaniko-based
+# builder rejects both the upstream form (missing id) and the id-only form
+# (missing cacheKey prefix). The build is small enough that losing cache is OK.
+RUN uv sync --frozen --no-dev && \
     if [ -n "$GRAPHITI_VERSION" ]; then \
         if [ "$INSTALL_FALKORDB" = "true" ]; then \
             uv pip install --system --upgrade "graphiti-core[falkordb]==$GRAPHITI_VERSION"; \
