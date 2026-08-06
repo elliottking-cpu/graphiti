@@ -1,7 +1,7 @@
 import logging
 from typing import Annotated
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from graphiti_core import Graphiti  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
@@ -71,7 +71,22 @@ class ZepGraphiti(Graphiti):
             raise HTTPException(status_code=404, detail=e.message) from e
 
 
-async def get_graphiti(settings: ZepEnvDep):
+def get_graphiti(request: Request) -> ZepGraphiti:
+    # Septics Hub patch: return the long-lived Graphiti instance built once
+    # in the app lifespan. Previously we created and closed a ZepGraphiti per
+    # HTTP request, which meant queued AsyncWorker jobs (see routers/ingest.py)
+    # would try to reuse an already-closed Neo4j driver and raise
+    # `SessionExpired: Failed to obtain connection towards WRITE server`.
+    client = getattr(request.app.state, 'graphiti', None)
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail='Graphiti is not initialised. Retry once the service has finished startup.',
+        )
+    return client
+
+
+async def initialize_graphiti(settings: ZepEnvDep) -> ZepGraphiti:
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
@@ -83,20 +98,8 @@ async def get_graphiti(settings: ZepEnvDep):
         client.llm_client.config.api_key = settings.openai_api_key
     if settings.model_name is not None:
         client.llm_client.model = settings.model_name
-
-    try:
-        yield client
-    finally:
-        await client.close()
-
-
-async def initialize_graphiti(settings: ZepEnvDep):
-    client = ZepGraphiti(
-        uri=settings.neo4j_uri,
-        user=settings.neo4j_user,
-        password=settings.neo4j_password,
-    )
     await client.build_indices_and_constraints()
+    return client
 
 
 def get_fact_result_from_edge(edge: EntityEdge):

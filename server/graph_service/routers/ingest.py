@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 from functools import partial
 
 from fastapi import APIRouter, status
@@ -19,6 +20,7 @@ from graph_service.zep_graphiti import ZepGraphitiDep
 # var GRAPHITI_WORKER_CONCURRENCY (defaults to 4) so the deployment
 # can dial it up/down depending on the OpenAI rate-limit budget.
 _DEFAULT_WORKER_CONCURRENCY = 4
+_DEFAULT_WORKER_MAX_RETRIES = 3
 
 
 def _resolve_worker_concurrency() -> int:
@@ -32,11 +34,57 @@ def _resolve_worker_concurrency() -> int:
     return max(1, min(n, 16))
 
 
+def _resolve_worker_max_retries() -> int:
+    raw = os.environ.get('GRAPHITI_WORKER_MAX_RETRIES')
+    if not raw:
+        return _DEFAULT_WORKER_MAX_RETRIES
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_WORKER_MAX_RETRIES
+    # Clamp: 1 = no retries, 10 = 9 retries. Beyond that a stuck message can
+    # tie up a worker for minutes.
+    return max(1, min(n, 10))
+
+
+# Septics Hub patch: import neo4j transient error classes lazily so the module
+# still imports cleanly on machines that don't have neo4j installed (tests).
+# We treat these as retryable; everything else is treated as permanent.
+def _neo4j_transient_exceptions() -> tuple[type[BaseException], ...]:
+    try:
+        from neo4j.exceptions import (  # type: ignore
+            ServiceUnavailable,
+            SessionExpired,
+            TransientError,
+            WriteServiceUnavailable,
+        )
+    except ImportError:
+        return ()
+    return (ServiceUnavailable, SessionExpired, TransientError, WriteServiceUnavailable)
+
+
+def _is_transient_neo4j_error(exc: BaseException) -> bool:
+    transient_types = _neo4j_transient_exceptions()
+    if transient_types and isinstance(exc, transient_types):
+        return True
+    # Fallback for driver messages we've seen in production even when the
+    # exception type check fails (e.g. because graphiti wraps it in another
+    # exception): pattern-match the message.
+    msg = str(exc)
+    return (
+        'SessionExpired' in msg
+        or 'ServiceUnavailable' in msg
+        or 'Failed to obtain connection' in msg
+        or 'connection is closed' in msg.lower()
+    )
+
+
 class AsyncWorker:
     def __init__(self):
         self.queue = asyncio.Queue()
         self.tasks: list[asyncio.Task] = []
         self.concurrency = _resolve_worker_concurrency()
+        self.max_retries = _resolve_worker_max_retries()
 
     async def worker(self, worker_id: int):
         # Septics Hub patch: catch ALL exceptions from a job so one failure
@@ -50,20 +98,67 @@ class AsyncWorker:
                 break
             print(f'Worker {worker_id} got a job: (size of remaining queue: {self.queue.qsize()})')
             try:
-                await job()
+                await self._run_with_retries(worker_id, job)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                logging.exception(f'[graphiti] ingest job failed on worker {worker_id}; worker continues')
             finally:
                 self.queue.task_done()
+
+    async def _run_with_retries(self, worker_id: int, job) -> None:
+        # Septics Hub patch: retry on transient Neo4j errors before dropping.
+        # SessionExpired / ServiceUnavailable are common after a Neo4j restart
+        # and were producing silent data loss (whole batch dropped). We back
+        # off with jitter so a Neo4j restart storm doesn't stampede.
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await job()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - we log below
+                transient = _is_transient_neo4j_error(exc)
+                if transient and attempt < self.max_retries:
+                    delay = min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5)
+                    logging.warning(
+                        '[graphiti] worker %s: transient Neo4j error on attempt %s/%s, '
+                        'retrying in %.1fs: %s',
+                        worker_id,
+                        attempt,
+                        self.max_retries,
+                        delay,
+                        exc,
+                    )
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+                if transient:
+                    logging.error(
+                        '[graphiti] worker %s: transient Neo4j error exhausted %s retries; '
+                        'dropping job for hub cron to reingest: %s',
+                        worker_id,
+                        self.max_retries,
+                        exc,
+                    )
+                else:
+                    logging.exception(
+                        '[graphiti] ingest job failed on worker %s; worker continues',
+                        worker_id,
+                    )
+                return
 
     async def start(self):
         self.tasks = [
             asyncio.create_task(self.worker(i + 1))
             for i in range(self.concurrency)
         ]
-        print(f'AsyncWorker started with concurrency={self.concurrency}')
+        print(
+            f'AsyncWorker started with concurrency={self.concurrency}, '
+            f'max_retries={self.max_retries}'
+        )
 
     async def stop(self):
         for task in self.tasks:
